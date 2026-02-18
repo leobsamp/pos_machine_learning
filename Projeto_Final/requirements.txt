@@ -2,3 +2,7 @@ streamlit
 pandas
 requests
 plotly
+numpy
+pyarrow
+boto3
+s3fs
