@@ -96,11 +96,11 @@ def versao_por_ano(ano: int) -> str:
 
 
 @st.cache_data(ttl=3600)
-def carregar_scr_parquet(conn: FilesConnection, ano: int) -> pd.DataFrame:
+def carregar_scr_parquet(_conn: FilesConnection, ano: int) -> pd.DataFrame:
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
     key = f"{prefix}ano={ano}/scrdata_{ano}.parquet"
-    return conn.read(s3_path(key), input_format="parquet")
+    return _conn.read(s3_path(key), input_format="parquet")
 
 
 # ==============================
