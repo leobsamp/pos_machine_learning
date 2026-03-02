@@ -85,73 +85,131 @@ def _anon_fs() -> s3fs.S3FileSystem:
 
 @st.cache_data(ttl=3600)
 def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
+    import pyarrow as pa
+
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
-
-    base_prefix = f"{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
     fs = _anon_fs()
+    file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
 
+    # Tenta listar se for "diretório" de parquets
     paths = []
     try:
+        base_prefix = f"{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
         paths = [p for p in fs.ls(base_prefix) if p.endswith(".parquet")]
     except Exception:
         paths = []
 
-    def _normalizar_ano(df: pd.DataFrame) -> pd.DataFrame:
-        """Garante que a coluna 'ano' seja sempre Int64, independente do tipo original."""
-        if "ano" in df.columns:
-            df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
-        return df
-
     if not paths:
-        file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
-        # Lê com unified_schema para evitar conflito de tipos entre row groups
-        table = pq.read_table(file_path, filesystem=fs)
-        df = table.cast(
-            _schema_normalizado(table.schema)
-        ).to_pandas()
-    else:
-        import pyarrow as pa
-        tables = []
-        for p in paths:
-            with fs.open(p, "rb") as f:
-                t = pq.read_table(f)
-                # Converte colunas dictionary para seus value_type antes de concatenar
-                t = _cast_dict_columns(t)
-                tables.append(t)
-        # Agora todos os schemas são compatíveis
-        df = pa.concat_tables(tables, promote_options="default").to_pandas()
+        paths = [file_path.replace("s3://", "")]  # remove prefixo para uso com fs.open
 
-    return _normalizar_ano(df)
+    tables = []
+    for p in paths:
+        s3_path = p if p.startswith(S3_BUCKET) else p
+        with fs.open(s3_path, "rb") as f:
+            pf = pq.ParquetFile(f)
+            for i in range(pf.num_row_groups):
+                rg = pf.read_row_group(i)
+                rg = _cast_dict_columns(rg)
+                tables.append(rg)
+
+    if not tables:
+        return pd.DataFrame()
+
+    # Unifica schemas antes de concatenar
+    schemas = [t.schema for t in tables]
+    unified_schema = _unify_schemas(schemas)
+    tables = [_align_to_schema(t, unified_schema) for t in tables]
+
+    df = pa.concat_tables(tables).to_pandas()
+    return _normalizar_tipos(df)
 
 
 def _cast_dict_columns(table):
-    """Converte colunas do tipo dictionary para o tipo base (ex: dict<int32> -> int32)."""
+    """Converte todas as colunas dictionary para o tipo base."""
     import pyarrow as pa
+    new_columns = {}
     new_fields = []
-    new_columns = []
     for i, field in enumerate(table.schema):
         col = table.column(i)
         if pa.types.is_dictionary(field.type):
-            # Decodifica o dictionary para o tipo dos values
-            col = col.cast(field.type.value_type)
-            field = field.with_type(field.type.value_type)
+            target_type = field.type.value_type
+            col = col.cast(target_type)
+            field = field.with_type(target_type)
+        new_columns[field.name] = col
         new_fields.append(field)
-        new_columns.append(col)
-    new_schema = pa.schema(new_fields)
-    return pa.table(dict(zip(table.schema.names, new_columns)), schema=new_schema)
+    return pa.table(new_columns, schema=pa.schema(new_fields))
 
 
-def _schema_normalizado(schema):
-    """Retorna um schema onde todas as colunas dictionary são convertidas para seu value_type."""
+def _unify_schemas(schemas):
+    """
+    Constrói um schema unificado: para cada campo, escolhe o tipo
+    mais 'largo' encontrado entre os schemas (int32 < int64 < float64).
+    Strings e tipos incompatíveis são resolvidos como string (large_utf8).
+    """
     import pyarrow as pa
-    new_fields = []
-    for field in schema:
-        if pa.types.is_dictionary(field.type):
-            new_fields.append(field.with_type(field.type.value_type))
+
+    NUMERIC_RANK = {
+        pa.int8(): 0, pa.int16(): 1, pa.int32(): 2, pa.int64(): 3,
+        pa.float32(): 4, pa.float64(): 5,
+    }
+
+    field_types: dict[str, pa.DataType] = {}
+
+    for schema in schemas:
+        for field in schema:
+            name = field.name
+            t = field.type
+            if name not in field_types:
+                field_types[name] = t
+            else:
+                existing = field_types[name]
+                if existing == t:
+                    continue
+                # Ambos numéricos: promove para o maior
+                if t in NUMERIC_RANK and existing in NUMERIC_RANK:
+                    field_types[name] = t if NUMERIC_RANK[t] > NUMERIC_RANK[existing] else existing
+                else:
+                    # Fallback: usa string para tipos incompatíveis
+                    field_types[name] = pa.large_utf8()
+
+    return pa.schema([pa.field(name, t) for name, t in field_types.items()])
+
+
+def _align_to_schema(table, target_schema):
+    """
+    Alinha uma tabela ao schema alvo: faz cast de colunas existentes,
+    adiciona colunas ausentes como null, ignora colunas extras.
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    columns = {}
+    for field in target_schema:
+        if field.name in table.schema.names:
+            col = table.column(field.name)
+            try:
+                col = col.cast(field.type, safe=False)
+            except Exception:
+                # Cast impossível: converte para string
+                col = col.cast(pa.large_utf8(), safe=False)
+            columns[field.name] = col
         else:
-            new_fields.append(field)
-    return pa.schema(new_fields)
+            # Coluna ausente: preenche com nulls
+            columns[field.name] = pa.nulls(len(table), type=field.type)
+
+    return pa.table(columns, schema=target_schema)
+
+
+def _normalizar_tipos(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza tipos problemáticos conhecidos após conversão para pandas."""
+    if "ano" in df.columns:
+        df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+    if "mes" in df.columns:
+        df["mes"] = pd.to_numeric(df["mes"], errors="coerce").astype("Int64")
+    if "data_base" in df.columns:
+        df["data_base"] = pd.to_datetime(df["data_base"], errors="coerce")
+    return df
 
 # ==============================
 # UI
