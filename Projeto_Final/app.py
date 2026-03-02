@@ -88,34 +88,70 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
 
-    # Pode ser 1 arquivo OU um "diretório" com vários parquets
     base_prefix = f"{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
     fs = _anon_fs()
 
     paths = []
     try:
-        # Se for "diretório", isso retorna vários objetos
         paths = [p for p in fs.ls(base_prefix) if p.endswith(".parquet")]
     except Exception:
         paths = []
 
+    def _normalizar_ano(df: pd.DataFrame) -> pd.DataFrame:
+        """Garante que a coluna 'ano' seja sempre Int64, independente do tipo original."""
+        if "ano" in df.columns:
+            df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+        return df
+
     if not paths:
-        # fallback: tratar como arquivo único
         file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
-        df = pd.read_parquet(file_path, filesystem=fs)
+        # Lê com unified_schema para evitar conflito de tipos entre row groups
+        table = pq.read_table(file_path, filesystem=fs)
+        df = table.cast(
+            _schema_normalizado(table.schema)
+        ).to_pandas()
     else:
+        import pyarrow as pa
         tables = []
         for p in paths:
             with fs.open(p, "rb") as f:
-                tables.append(pq.read_table(f))
-        df = pd.concat([t.to_pandas() for t in tables], ignore_index=True)
+                t = pq.read_table(f)
+                # Converte colunas dictionary para seus value_type antes de concatenar
+                t = _cast_dict_columns(t)
+                tables.append(t)
+        # Agora todos os schemas são compatíveis
+        df = pa.concat_tables(tables, promote_options="default").to_pandas()
 
-    # Padroniza tipo da coluna problemática
-    if "ano" in df.columns:
-        df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+    return _normalizar_ano(df)
 
-    return df
 
+def _cast_dict_columns(table):
+    """Converte colunas do tipo dictionary para o tipo base (ex: dict<int32> -> int32)."""
+    import pyarrow as pa
+    new_fields = []
+    new_columns = []
+    for i, field in enumerate(table.schema):
+        col = table.column(i)
+        if pa.types.is_dictionary(field.type):
+            # Decodifica o dictionary para o tipo dos values
+            col = col.cast(field.type.value_type)
+            field = field.with_type(field.type.value_type)
+        new_fields.append(field)
+        new_columns.append(col)
+    new_schema = pa.schema(new_fields)
+    return pa.table(dict(zip(table.schema.names, new_columns)), schema=new_schema)
+
+
+def _schema_normalizado(schema):
+    """Retorna um schema onde todas as colunas dictionary são convertidas para seu value_type."""
+    import pyarrow as pa
+    new_fields = []
+    for field in schema:
+        if pa.types.is_dictionary(field.type):
+            new_fields.append(field.with_type(field.type.value_type))
+        else:
+            new_fields.append(field)
+    return pa.schema(new_fields)
 
 # ==============================
 # UI
