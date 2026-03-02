@@ -60,6 +60,16 @@ def _anon_fs() -> s3fs.S3FileSystem:
     return s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
 
 
+@st.cache_resource
+def _get_anon_fs() -> s3fs.S3FileSystem:
+    """
+    Usa cache_resource (não cache_data) pois s3fs.S3FileSystem não é
+    serializável por pickle — cache_resource mantém o objeto em memória
+    sem tentar serializá-lo, adequado para conexões e recursos externos.
+    """
+    return s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
+
+
 # ==============================
 # LEITURA S3 (com normalização de schema)
 # ==============================
@@ -134,7 +144,7 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
 
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
-    fs = _anon_fs()
+    fs = _get_anon_fs()
     file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
 
     paths = []
@@ -521,6 +531,8 @@ elif fonte == "SCR — Indicadores de Crédito":
         st.info("Coluna 'modalidade' não encontrada nos dados deste ano.")
 
     st.divider()
+
+    # ---- Ranking de UF ----
     st.subheader("🗺️ Ranking de UF por Inadimplência")
     df_uf = agregar_inadimplencia_por_uf(df_scr)
 
@@ -769,21 +781,24 @@ elif fonte == "Correlações entre Indicadores":
             st.divider()
             st.subheader("📐 Correlação de Pearson")
 
+            # Alinha as séries pela data (resample mensal)
             def _para_serie_mensal(s: pd.Series) -> pd.Series:
                 """Garante DatetimeIndex e resample mensal, lidando com índices anuais (int)."""
-                idx = s.index
-                # Se o índice for numérico (anos inteiros), converte para timestamp
-                if not isinstance(idx, pd.DatetimeIndex):
+                if not isinstance(s.index, pd.DatetimeIndex):
                     try:
                         s = s.copy()
-                        s.index = pd.to_datetime(idx.astype(str) + "-06-30")
+                        s.index = pd.to_datetime(s.index.astype(str) + "-06-30")
                     except Exception:
                         return s
                 return s.resample("ME").mean()
 
+            # Renomeia para nomes fixos antes do merge para evitar colisão com nomes dinâmicos
+            s1_m = _para_serie_mensal(serie_e1).rename("e1")
+            s2_m = _para_serie_mensal(serie_e2).rename("e2")
+
             df_merged = pd.merge(
-                _para_serie_mensal(serie_e1).reset_index().rename(columns={0: "e1", "index": "data", serie_e1.name: "e1"}),
-                _para_serie_mensal(serie_e2).reset_index().rename(columns={0: "e2", "index": "data", serie_e2.name: "e2"}),
+                s1_m.reset_index().rename(columns={"index": "data"}),
+                s2_m.reset_index().rename(columns={"index": "data"}),
                 on="data",
                 how="inner",
             ).dropna()
@@ -809,7 +824,7 @@ elif fonte == "Correlações entre Indicadores":
                     f"(r = {corr:.4f}), calculada sobre {len(df_merged)} observações mensais comuns."
                 )
 
-                # Scatter plot auxiliar com linha de tendência (sem dependência de statsmodels)
+                # Scatter plot com linha de tendência via numpy (sem dependência de statsmodels)
                 x_vals = df_merged["e1"].values
                 y_vals = df_merged["e2"].values
                 coef = np.polyfit(x_vals, y_vals, 1)
