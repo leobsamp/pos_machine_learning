@@ -63,9 +63,9 @@ def _anon_fs() -> s3fs.S3FileSystem:
 @st.cache_resource
 def _get_anon_fs() -> s3fs.S3FileSystem:
     """
-    Usa cache_resource (não cache_data) pois s3fs.S3FileSystem não é
-    serializável por pickle — cache_resource mantém o objeto em memória
-    sem tentar serializá-lo, adequado para conexões e recursos externos.
+    Usa @st.cache_resource (não @st.cache_data) porque s3fs.S3FileSystem
+    não é serializável por pickle. cache_resource mantém o objeto em memória
+    sem tentar serializá-lo — correto para conexões e recursos externos.
     """
     return s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
 
@@ -144,6 +144,9 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
 
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
+    # Usa _get_anon_fs() (cache_resource) em vez de _anon_fs() para evitar
+    # que o objeto s3fs.S3FileSystem seja serializado pelo cache_data, o que
+    # causaria TypeError/hang no Streamlit.
     fs = _get_anon_fs()
     file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
 
@@ -159,12 +162,19 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
 
     tables = []
     for p in paths:
-        with fs.open(p, "rb") as f:
-            pf = pq.ParquetFile(f)
-            for i in range(pf.num_row_groups):
-                rg = pf.read_row_group(i)
-                rg = _cast_dict_columns(rg)
-                tables.append(rg)
+        try:
+            with fs.open(p, "rb") as f:
+                pf = pq.ParquetFile(f)
+                for i in range(pf.num_row_groups):
+                    try:
+                        rg = pf.read_row_group(i)
+                        rg = _cast_dict_columns(rg)
+                        tables.append(rg)
+                    except Exception as rg_err:
+                        st.warning(f"Row group {i} do ano {ano} ignorado: {rg_err}")
+        except Exception as file_err:
+            st.warning(f"Não foi possível abrir o arquivo para o ano {ano}: {file_err}")
+            continue
 
     if not tables:
         return pd.DataFrame()
@@ -781,9 +791,12 @@ elif fonte == "Correlações entre Indicadores":
             st.divider()
             st.subheader("📐 Correlação de Pearson")
 
-            # Alinha as séries pela data (resample mensal)
             def _para_serie_mensal(s: pd.Series) -> pd.Series:
-                """Garante DatetimeIndex e resample mensal, lidando com índices anuais (int)."""
+                """
+                Garante DatetimeIndex antes de resample.
+                Séries do SCR têm índice int (ano); séries BCB têm DatetimeIndex.
+                Sem esta conversão, resample('ME') lança TypeError.
+                """
                 if not isinstance(s.index, pd.DatetimeIndex):
                     try:
                         s = s.copy()
@@ -792,13 +805,24 @@ elif fonte == "Correlações entre Indicadores":
                         return s
                 return s.resample("ME").mean()
 
-            # Renomeia para nomes fixos antes do merge para evitar colisão com nomes dinâmicos
+            # Renomeia para nomes fixos ANTES do merge para evitar colisão
+            # quando serie_e1.name ou serie_e2.name coincidem com "data"
+            # ou quando os dois indicadores têm o mesmo nome.
             s1_m = _para_serie_mensal(serie_e1).rename("e1")
             s2_m = _para_serie_mensal(serie_e2).rename("e2")
 
+            # reset_index() nomeia a coluna do índice com o nome original do índice.
+            # Se o índice não tinha nome, a coluna se chama "index", não "data".
+            # Por isso renomeamos explicitamente qualquer coluna não-valor para "data".
+            def _reset_com_data(s: pd.Series) -> pd.DataFrame:
+                df_r = s.reset_index()
+                # A primeira coluna é sempre o índice (data); a segunda é o valor
+                df_r.columns = ["data", s.name]
+                return df_r
+
             df_merged = pd.merge(
-                s1_m.reset_index().rename(columns={"index": "data"}),
-                s2_m.reset_index().rename(columns={"index": "data"}),
+                _reset_com_data(s1_m),
+                _reset_com_data(s2_m),
                 on="data",
                 how="inner",
             ).dropna()
@@ -824,7 +848,9 @@ elif fonte == "Correlações entre Indicadores":
                     f"(r = {corr:.4f}), calculada sobre {len(df_merged)} observações mensais comuns."
                 )
 
-                # Scatter plot com linha de tendência via numpy (sem dependência de statsmodels)
+                # Scatter plot com linha de tendência via numpy.polyfit
+                # (px.scatter trendline="ols" requer statsmodels, que não está
+                # no requirements.txt e causaria ValueError em runtime)
                 x_vals = df_merged["e1"].values
                 y_vals = df_merged["e2"].values
                 coef = np.polyfit(x_vals, y_vals, 1)
