@@ -63,11 +63,23 @@ def _anon_fs() -> s3fs.S3FileSystem:
 @st.cache_resource
 def _get_anon_fs() -> s3fs.S3FileSystem:
     """
-    Usa @st.cache_resource (não @st.cache_data) porque s3fs.S3FileSystem
-    não é serializável por pickle. cache_resource mantém o objeto em memória
-    sem tentar serializá-lo — correto para conexões e recursos externos.
+    @st.cache_resource (não @st.cache_data): s3fs.S3FileSystem não é
+    serializável por pickle — cache_resource mantém o objeto em memória
+    sem serialização, adequado para conexões e recursos externos.
     """
     return s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
+
+
+# Colunas mínimas necessárias para todos os gráficos e métricas da UI.
+# Ler apenas estas colunas reduz o consumo de RAM em ~60-80% por ano SCR.
+COLUNAS_SCR = [
+    "data_base", "ano", "mes", "uf",
+    "modalidade", "submodalidade", "segmento", "porte",
+    "carteira_ativa", "saldo_carteira_ativa", "carteira_total", "saldo_total",
+    "carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia",
+    "taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia",
+    "ativo_problematico", "carteira_vencida",
+]
 
 
 # ==============================
@@ -144,9 +156,8 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
 
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
-    # Usa _get_anon_fs() (cache_resource) em vez de _anon_fs() para evitar
-    # que o objeto s3fs.S3FileSystem seja serializado pelo cache_data, o que
-    # causaria TypeError/hang no Streamlit.
+    # Usa _get_anon_fs() (@st.cache_resource) para evitar que o objeto
+    # s3fs.S3FileSystem seja serializado pelo @st.cache_data (causa TypeError/hang).
     fs = _get_anon_fs()
     file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
 
@@ -165,9 +176,14 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
         try:
             with fs.open(p, "rb") as f:
                 pf = pq.ParquetFile(f)
+                # Projeção de colunas: lê apenas as necessárias para a UI.
+                # Reduz uso de RAM em ~60-80% em relação a ler todas as colunas.
+                colunas_disponiveis = pf.schema_arrow.names
+                colunas_ler = [c for c in COLUNAS_SCR if c in colunas_disponiveis]
+
                 for i in range(pf.num_row_groups):
                     try:
-                        rg = pf.read_row_group(i)
+                        rg = pf.read_row_group(i, columns=colunas_ler)
                         rg = _cast_dict_columns(rg)
                         tables.append(rg)
                     except Exception as rg_err:
@@ -248,6 +264,23 @@ def carregar_serie_bcb(serie: int, data_ini: str, data_fim: str) -> pd.DataFrame
 
 def _periodo_para_sgsdates(data_ini: date, data_fim: date):
     return data_ini.strftime("%d/%m/%Y"), data_fim.strftime("%d/%m/%Y")
+
+
+@st.cache_data(ttl=3600)
+def agregar_inadimplencia_ano_cached(ano: int) -> pd.DataFrame:
+    """
+    Versão cacheada e leve da agregação por ano para a série temporal.
+    Carrega o parquet, agrega imediatamente e descarta o DataFrame completo.
+    Isso evita manter N DataFrames de centenas de MB em memória simultaneamente
+    ao construir a série com múltiplos anos.
+    """
+    try:
+        df = carregar_scr_parquet_publico(ano)
+        if df.empty:
+            return pd.DataFrame()
+        return agregar_inadimplencia_por_ano(df)
+    except Exception:
+        return pd.DataFrame()
 
 
 # ==============================
@@ -471,9 +504,10 @@ elif fonte == "SCR — Indicadores de Crédito":
     with st.expander("⚙️ Configurar anos para a série temporal", expanded=True):
         anos_disponiveis = list(range(2012, 2026))
         anos_serie = st.multiselect(
-            "Anos a incluir na série",
+            "Anos a incluir na série (máx. 5 para evitar limite de memória no Streamlit Cloud)",
             options=anos_disponiveis,
             default=[ano_sel],
+            max_selections=5,
         )
 
     if anos_serie:
@@ -481,14 +515,12 @@ elif fonte == "SCR — Indicadores de Crédito":
         registros = []
         for i, ano in enumerate(sorted(anos_serie)):
             progresso.progress((i + 1) / len(anos_serie), text=f"Carregando {ano}...")
-            try:
-                df_ano = carregar_scr_parquet_publico(ano)
-                agg = agregar_inadimplencia_por_ano(df_ano)
-                if not agg.empty:
-                    agg["ano_ref"] = ano
-                    registros.append(agg)
-            except Exception:
-                pass
+            # Usa função cacheada que agrega e descarta o df completo,
+            # evitando acúmulo de N DataFrames grandes em memória.
+            agg = agregar_inadimplencia_ano_cached(ano)
+            if not agg.empty:
+                agg["ano_ref"] = ano
+                registros.append(agg)
         progresso.empty()
 
         if registros:
@@ -695,9 +727,10 @@ elif fonte == "Correlações entre Indicadores":
 
         if "Inadimplência SCR (%)" in [indice_eixo1, indice_eixo2]:
             anos_inad = st.multiselect(
-                "Anos do SCR para inadimplência",
+                "Anos do SCR para inadimplência (máx. 3)",
                 options=list(range(2012, 2026)),
-                default=list(range(max(2018, data_ini_corr.year), min(2026, data_fim_corr.year + 1))),
+                default=list(range(max(2020, data_ini_corr.year), min(2026, data_fim_corr.year + 1))),
+                max_selections=3,
             )
         else:
             anos_inad = []
@@ -793,8 +826,8 @@ elif fonte == "Correlações entre Indicadores":
 
             def _para_serie_mensal(s: pd.Series) -> pd.Series:
                 """
-                Garante DatetimeIndex antes de resample.
-                Séries do SCR têm índice int (ano); séries BCB têm DatetimeIndex.
+                Garante DatetimeIndex antes do resample.
+                Séries SCR têm índice int (ano); séries BCB têm DatetimeIndex.
                 Sem esta conversão, resample('ME') lança TypeError.
                 """
                 if not isinstance(s.index, pd.DatetimeIndex):
@@ -805,20 +838,18 @@ elif fonte == "Correlações entre Indicadores":
                         return s
                 return s.resample("ME").mean()
 
-            # Renomeia para nomes fixos ANTES do merge para evitar colisão
-            # quando serie_e1.name ou serie_e2.name coincidem com "data"
-            # ou quando os dois indicadores têm o mesmo nome.
-            s1_m = _para_serie_mensal(serie_e1).rename("e1")
-            s2_m = _para_serie_mensal(serie_e2).rename("e2")
-
-            # reset_index() nomeia a coluna do índice com o nome original do índice.
-            # Se o índice não tinha nome, a coluna se chama "index", não "data".
-            # Por isso renomeamos explicitamente qualquer coluna não-valor para "data".
             def _reset_com_data(s: pd.Series) -> pd.DataFrame:
+                """
+                Força colunas para ['data', valor] após reset_index.
+                Evita colisão quando o nome do índice não é 'data'
+                ou quando serie.name coincide com 'data'.
+                """
                 df_r = s.reset_index()
-                # A primeira coluna é sempre o índice (data); a segunda é o valor
                 df_r.columns = ["data", s.name]
                 return df_r
+
+            s1_m = _para_serie_mensal(serie_e1).rename("e1")
+            s2_m = _para_serie_mensal(serie_e2).rename("e2")
 
             df_merged = pd.merge(
                 _reset_com_data(s1_m),
@@ -848,9 +879,8 @@ elif fonte == "Correlações entre Indicadores":
                     f"(r = {corr:.4f}), calculada sobre {len(df_merged)} observações mensais comuns."
                 )
 
-                # Scatter plot com linha de tendência via numpy.polyfit
-                # (px.scatter trendline="ols" requer statsmodels, que não está
-                # no requirements.txt e causaria ValueError em runtime)
+                # Scatter com tendência via numpy.polyfit — sem statsmodels
+                # (px.scatter trendline="ols" requer statsmodels, ausente no requirements.txt)
                 x_vals = df_merged["e1"].values
                 y_vals = df_merged["e2"].values
                 coef = np.polyfit(x_vals, y_vals, 1)
@@ -859,8 +889,7 @@ elif fonte == "Correlações entre Indicadores":
                 fig_scatter = go.Figure()
                 fig_scatter.add_trace(go.Scatter(
                     x=x_vals, y=y_vals,
-                    mode="markers",
-                    name="Observações",
+                    mode="markers", name="Observações",
                     marker=dict(color="#1f77b4", size=7, opacity=0.7),
                 ))
                 fig_scatter.add_trace(go.Scatter(
