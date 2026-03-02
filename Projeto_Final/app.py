@@ -4,6 +4,8 @@ import streamlit as st
 import plotly.graph_objects as go
 import s3fs
 from datetime import date
+import pyarrow.parquet as pq
+
 
 # ==============================
 # CONFIG
@@ -85,10 +87,34 @@ def _anon_fs() -> s3fs.S3FileSystem:
 def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
-    key = f"{prefix}ano={ano}/scrdata_{ano}.parquet"
-    path = f"s3://{S3_BUCKET}/{key}"
+
+    # Pode ser 1 arquivo OU um "diretório" com vários parquets
+    base_prefix = f"{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
     fs = _anon_fs()
-    return pd.read_parquet(path, filesystem=fs)
+
+    paths = []
+    try:
+        # Se for "diretório", isso retorna vários objetos
+        paths = [p for p in fs.ls(base_prefix) if p.endswith(".parquet")]
+    except Exception:
+        paths = []
+
+    if not paths:
+        # fallback: tratar como arquivo único
+        file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
+        df = pd.read_parquet(file_path, filesystem=fs)
+    else:
+        tables = []
+        for p in paths:
+            with fs.open(p, "rb") as f:
+                tables.append(pq.read_table(f))
+        df = pd.concat([t.to_pandas() for t in tables], ignore_index=True)
+
+    # Padroniza tipo da coluna problemática
+    if "ano" in df.columns:
+        df["ano"] = pd.to_numeric(df["ano"], errors="coerce").astype("Int64")
+
+    return df
 
 
 # ==============================
