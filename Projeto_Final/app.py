@@ -22,6 +22,7 @@ V2_YEARS = [2024, 2025]
 S3_PREFIX_V1_KEY = "scr/processed/versao=v1/"
 S3_PREFIX_V2_KEY = "scr/processed/versao=v2/"
 
+conn_s3 = st.connection("s3", type=FilesConnection)
 
 # ==============================
 # Helpers
