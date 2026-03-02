@@ -7,7 +7,8 @@ import streamlit as st
 import plotly.graph_objects as go
 from st_files_connection import FilesConnection
 
-
+st.write("secrets keys:", list(st.secrets.keys()))
+st.write("connections keys:", list(st.secrets.get("connections", {}).keys()))
 # ==============================
 # CONFIG
 # ==============================
