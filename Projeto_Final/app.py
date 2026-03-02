@@ -1,3 +1,4 @@
+import os
 import re
 from datetime import date
 
@@ -7,8 +8,6 @@ import streamlit as st
 import plotly.graph_objects as go
 from st_files_connection import FilesConnection
 
-st.write("secrets keys:", list(st.secrets.keys()))
-st.write("connections keys:", list(st.secrets.get("connections", {}).keys()))
 # ==============================
 # CONFIG
 # ==============================
@@ -16,21 +15,42 @@ st.set_page_config(page_title="Painel BCB — PTAX & SCR", layout="wide")
 
 S3_BUCKET = "projeto-bcb-scr-datalake"
 
-# Regras de versionamento (conforme solicitado)
+# Regras de versionamento
 V1_YEARS = list(range(2012, 2024))  # 2012..2023
 V2_YEARS = [2024, 2025]
 
 S3_PREFIX_V1_KEY = "scr/processed/versao=v1/"
 S3_PREFIX_V2_KEY = "scr/processed/versao=v2/"
 
-conn_s3 = st.connection("s3", type=FilesConnection)
-
 # ==============================
-# Helpers
+# Helpers (gerais)
 # ==============================
 def s3_path(key: str) -> str:
     key = key.lstrip("/")
     return f"s3://{S3_BUCKET}/{key}"
+
+
+def aws_creds_present() -> bool:
+    """No Streamlit Cloud, Secrets (raiz) viram env vars.
+    Localmente, você pode usar:
+      - ./.streamlit/secrets.toml com AWS_* (recomendado)
+      - variáveis de ambiente AWS_*
+      - AWS_PROFILE (com credenciais no ~/.aws/credentials)
+    """
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return True
+    if os.environ.get("AWS_PROFILE"):
+        return True
+    return False
+
+
+def get_s3_connection() -> tuple[FilesConnection | None, Exception | None]:
+    """Cria conexão S3 com fallback e mensagem amigável."""
+    try:
+        conn = st.connection("s3", type=FilesConnection)
+        return conn, None
+    except Exception as e:
+        return None, e
 
 
 def pick_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -99,6 +119,7 @@ def versao_por_ano(ano: int) -> str:
 
 @st.cache_data(ttl=3600)
 def carregar_scr_parquet(_conn: FilesConnection, ano: int) -> pd.DataFrame:
+    # Observação: _conn (underscore) evita erro de hash no cache
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
     key = f"{prefix}ano={ano}/scrdata_{ano}.parquet"
@@ -176,12 +197,26 @@ if fonte == "PTAX (Dólar)":
 else:
     st.subheader("🏦 SCR — Sistema de Informações de Crédito (Parquet no S3)")
 
-    conn = st.connection("s3", type=FilesConnection)
+    # Cria conexão 1x e diagnostica credenciais automaticamente (Cloud e local)
+    conn, conn_err = get_s3_connection()
+
+    if conn is None:
+        st.error("Não foi possível inicializar a conexão com o S3.")
+        if not aws_creds_present():
+            st.info(
+                "Credenciais AWS não encontradas.\n\n"
+                "**Streamlit Cloud:** em *Manage app → Secrets*, defina (no nível raiz):\n"
+                "- `AWS_ACCESS_KEY_ID`\n"
+                "- `AWS_SECRET_ACCESS_KEY`\n"
+                "- `AWS_DEFAULT_REGION`\n\n"
+                "**Local:** crie `./.streamlit/secrets.toml` com as mesmas chaves, ou exporte variáveis de ambiente."
+            )
+        st.write(f"Detalhe técnico: {conn_err}")
+        st.stop()
 
     with st.sidebar:
         st.divider()
         st.subheader("Parâmetros SCR")
-        # Usuário escolhe apenas o ano
         ano_sel = st.selectbox("Ano", list(range(2012, 2026)), index=(2025 - 2012))
 
     with st.spinner(f"Carregando SCR {ano_sel} do S3..."):
@@ -213,21 +248,23 @@ else:
     c1, c2, c3 = st.columns(3)
 
     if col_ativa:
-        c1.metric("Carteira ativa (soma)", f"{df_scr[col_ativa].fillna(0).sum():,.2f}")
+        c1.metric("Carteira ativa (soma)", f"{pd.to_numeric(df_scr[col_ativa], errors='coerce').fillna(0).sum():,.2f}")
     else:
         c1.metric("Carteira ativa (soma)", "N/D")
 
     if col_inad:
-        c2.metric("Carteira inadimplência (soma)", f"{df_scr[col_inad].fillna(0).sum():,.2f}")
+        c2.metric(
+            "Carteira inadimplência (soma)",
+            f"{pd.to_numeric(df_scr[col_inad], errors='coerce').fillna(0).sum():,.2f}",
+        )
     else:
         c2.metric("Carteira inadimplência (soma)", "N/D")
 
     if col_taxa:
-        s = df_scr[col_taxa].dropna()
+        s = pd.to_numeric(df_scr[col_taxa], errors="coerce").dropna()
         if not s.empty:
             val = float(s.mean())
-            # inferência simples: > 1.5 => já está em 0-100
-            taxa_pct = val if val > 1.5 else val * 100
+            taxa_pct = val if val > 1.5 else val * 100  # heurística simples
             c3.metric("Taxa inadimplência (média)", f"{taxa_pct:.2f}%")
         else:
             c3.metric("Taxa inadimplência (média)", "N/D")
