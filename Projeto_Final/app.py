@@ -3,10 +3,9 @@ import numpy as np
 import requests
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import s3fs
-from datetime import date, datetime
+from datetime import date
 import pyarrow.parquet as pq
 
 # ==============================
@@ -438,6 +437,8 @@ elif fonte == "SCR — Indicadores de Crédito":
             val = float(s.mean())
             taxa_pct = val if val > 1.5 else val * 100
             c3.metric("Taxa de Inadimplência Média", f"{taxa_pct:.2f}%")
+        else:
+            c3.metric("Taxa de Inadimplência Média", "N/D")
     else:
         c3.metric("Taxa de Inadimplência Média", "N/D")
 
@@ -495,7 +496,31 @@ elif fonte == "SCR — Indicadores de Crédito":
 
     st.divider()
 
-    # ---- Aba 2: Ranking de UF ----
+    # ---- Composição da carteira por modalidade ----
+    st.subheader("📦 Composição da Carteira por Modalidade")
+    df_mod = agregar_carteira_por_modalidade(df_scr)
+
+    if not df_mod.empty:
+        df_mod = df_mod.dropna(subset=["carteira_ativa"]).sort_values("carteira_ativa", ascending=True)
+        fig_mod = go.Figure(go.Bar(
+            x=df_mod["carteira_ativa"],
+            y=df_mod["modalidade"],
+            orientation="h",
+            marker_color="#1f77b4",
+            text=df_mod["carteira_ativa"].map(lambda v: f"{v:,.0f}"),
+            textposition="outside",
+        ))
+        fig_mod.update_layout(
+            height=max(400, len(df_mod) * 26),
+            xaxis_title="Carteira Ativa (R$)",
+            yaxis_title="Modalidade",
+            margin=dict(l=200, r=80, t=30, b=40),
+        )
+        st.plotly_chart(fig_mod, use_container_width=True)
+    else:
+        st.info("Coluna 'modalidade' não encontrada nos dados deste ano.")
+
+    st.divider()
     st.subheader("🗺️ Ranking de UF por Inadimplência")
     df_uf = agregar_inadimplencia_por_uf(df_scr)
 
@@ -652,6 +677,8 @@ elif fonte == "Correlações entre Indicadores":
                 options=list(range(2012, 2026)),
                 default=list(range(max(2018, data_ini_corr.year), min(2026, data_fim_corr.year + 1))),
             )
+        else:
+            anos_inad = []
 
         calcular = st.button("Calcular correlações")
 
@@ -742,10 +769,21 @@ elif fonte == "Correlações entre Indicadores":
             st.divider()
             st.subheader("📐 Correlação de Pearson")
 
-            # Alinha as séries pela data (resample mensal)
+            def _para_serie_mensal(s: pd.Series) -> pd.Series:
+                """Garante DatetimeIndex e resample mensal, lidando com índices anuais (int)."""
+                idx = s.index
+                # Se o índice for numérico (anos inteiros), converte para timestamp
+                if not isinstance(idx, pd.DatetimeIndex):
+                    try:
+                        s = s.copy()
+                        s.index = pd.to_datetime(idx.astype(str) + "-06-30")
+                    except Exception:
+                        return s
+                return s.resample("ME").mean()
+
             df_merged = pd.merge(
-                serie_e1.resample("ME").mean().reset_index().rename(columns={serie_e1.name: "e1"}),
-                serie_e2.resample("ME").mean().reset_index().rename(columns={serie_e2.name: "e2"}),
+                _para_serie_mensal(serie_e1).reset_index().rename(columns={0: "e1", "index": "data", serie_e1.name: "e1"}),
+                _para_serie_mensal(serie_e2).reset_index().rename(columns={0: "e2", "index": "data", serie_e2.name: "e2"}),
                 on="data",
                 how="inner",
             ).dropna()
@@ -771,17 +809,32 @@ elif fonte == "Correlações entre Indicadores":
                     f"(r = {corr:.4f}), calculada sobre {len(df_merged)} observações mensais comuns."
                 )
 
-                # Scatter plot auxiliar
-                fig_scatter = px.scatter(
-                    df_merged,
-                    x="e1",
-                    y="e2",
-                    labels={"e1": indice_eixo1, "e2": indice_eixo2},
-                    trendline="ols",
+                # Scatter plot auxiliar com linha de tendência (sem dependência de statsmodels)
+                x_vals = df_merged["e1"].values
+                y_vals = df_merged["e2"].values
+                coef = np.polyfit(x_vals, y_vals, 1)
+                trend_y = np.polyval(coef, x_vals)
+
+                fig_scatter = go.Figure()
+                fig_scatter.add_trace(go.Scatter(
+                    x=x_vals, y=y_vals,
+                    mode="markers",
+                    name="Observações",
+                    marker=dict(color="#1f77b4", size=7, opacity=0.7),
+                ))
+                fig_scatter.add_trace(go.Scatter(
+                    x=x_vals, y=trend_y,
+                    mode="lines",
+                    name=f"Tendência (y = {coef[0]:.4f}x + {coef[1]:.4f})",
+                    line=dict(color="#e74c3c", width=2, dash="dash"),
+                ))
+                fig_scatter.update_layout(
+                    height=400,
+                    xaxis_title=indice_eixo1,
+                    yaxis_title=indice_eixo2,
                     title=f"Dispersão: {indice_eixo1} × {indice_eixo2}",
-                    color_discrete_sequence=["#1f77b4"],
+                    hovermode="closest",
                 )
-                fig_scatter.update_layout(height=400)
                 st.plotly_chart(fig_scatter, use_container_width=True)
             else:
                 st.warning("Período de sobreposição entre as séries muito curto para calcular correlação.")
