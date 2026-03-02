@@ -25,12 +25,22 @@ S3_PREFIX_V2_KEY = "scr/processed/versao=v2/"
 PTAX_BASE = "https://olinda.bcb.gov.br/olinda/servico/PTAX/versao/v1/odata"
 BCB_SERIES_BASE = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{serie}/dados"
 
-# Séries do BCB usadas no painel
 BCB_SERIES = {
-    "Selic (% a.a.)":       432,
-    "IPCA (% a.m.)":        433,
+    "Selic (% a.a.)":            432,
+    "IPCA (% a.m.)":             433,
     "Juros Crédito PF (% a.m.)": 20714,
 }
+
+# Projeção de colunas: lê apenas o necessário para a UI.
+# Reduz uso de RAM em ~60-80% por ano SCR em relação a ler todas as colunas.
+COLUNAS_SCR = [
+    "data_base", "ano", "mes", "uf",
+    "modalidade", "submodalidade", "segmento", "porte",
+    "carteira_ativa", "saldo_carteira_ativa", "carteira_total", "saldo_total",
+    "carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia",
+    "taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia",
+    "ativo_problematico", "carteira_vencida",
+]
 
 
 # ==============================
@@ -56,34 +66,17 @@ def _fmt_mmddyyyy(d: date) -> str:
     return d.strftime("%m-%d-%Y")
 
 
-def _anon_fs() -> s3fs.S3FileSystem:
-    return s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
-
-
+# FIX: @st.cache_resource para s3fs.S3FileSystem.
+# @st.cache_data tenta serializar (pickle) — s3fs não é serializável
+# e causa TypeError/crash no startup. cache_resource mantém o objeto
+# em memória sem pickle, adequado para conexões e recursos externos.
 @st.cache_resource
 def _get_anon_fs() -> s3fs.S3FileSystem:
-    """
-    @st.cache_resource (não @st.cache_data): s3fs.S3FileSystem não é
-    serializável por pickle — cache_resource mantém o objeto em memória
-    sem serialização, adequado para conexões e recursos externos.
-    """
     return s3fs.S3FileSystem(anon=True, client_kwargs={"region_name": S3_REGION})
-
-
-# Colunas mínimas necessárias para todos os gráficos e métricas da UI.
-# Ler apenas estas colunas reduz o consumo de RAM em ~60-80% por ano SCR.
-COLUNAS_SCR = [
-    "data_base", "ano", "mes", "uf",
-    "modalidade", "submodalidade", "segmento", "porte",
-    "carteira_ativa", "saldo_carteira_ativa", "carteira_total", "saldo_total",
-    "carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia",
-    "taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia",
-    "ativo_problematico", "carteira_vencida",
-]
 
 
 # ==============================
-# LEITURA S3 (com normalização de schema)
+# LEITURA S3 (normalização de schema)
 # ==============================
 def _cast_dict_columns(table):
     import pyarrow as pa
@@ -109,8 +102,7 @@ def _unify_schemas(schemas):
     field_types: dict = {}
     for schema in schemas:
         for field in schema:
-            name = field.name
-            t = field.type
+            name, t = field.name, field.type
             if name not in field_types:
                 field_types[name] = t
             else:
@@ -156,8 +148,8 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
 
     versao = versao_por_ano(ano)
     prefix = S3_PREFIX_V1_KEY if versao == "v1" else S3_PREFIX_V2_KEY
-    # Usa _get_anon_fs() (@st.cache_resource) para evitar que o objeto
-    # s3fs.S3FileSystem seja serializado pelo @st.cache_data (causa TypeError/hang).
+    # FIX: _get_anon_fs() via @st.cache_resource evita instanciar s3fs dentro
+    # de @st.cache_data (que tentaria pickle do FileSystem, causando crash).
     fs = _get_anon_fs()
     file_path = f"s3://{S3_BUCKET}/{prefix}ano={ano}/scrdata_{ano}.parquet"
 
@@ -176,11 +168,9 @@ def carregar_scr_parquet_publico(ano: int) -> pd.DataFrame:
         try:
             with fs.open(p, "rb") as f:
                 pf = pq.ParquetFile(f)
-                # Projeção de colunas: lê apenas as necessárias para a UI.
-                # Reduz uso de RAM em ~60-80% em relação a ler todas as colunas.
+                # FIX: projeção de colunas — reduz RAM em ~60-80% por ano
                 colunas_disponiveis = pf.schema_arrow.names
                 colunas_ler = [c for c in COLUNAS_SCR if c in colunas_disponiveis]
-
                 for i in range(pf.num_row_groups):
                     try:
                         rg = pf.read_row_group(i, columns=colunas_ler)
@@ -238,16 +228,8 @@ def dolar_diario(df: pd.DataFrame) -> pd.DataFrame:
 # ==============================
 @st.cache_data(ttl=3600)
 def carregar_serie_bcb(serie: int, data_ini: str, data_fim: str) -> pd.DataFrame:
-    """
-    Consulta série temporal do BCB via API SGS.
-    data_ini / data_fim no formato DD/MM/YYYY.
-    """
     url = BCB_SERIES_BASE.format(serie=serie)
-    params = {
-        "formato": "json",
-        "dataInicial": data_ini,
-        "dataFinal": data_fim,
-    }
+    params = {"formato": "json", "dataInicial": data_ini, "dataFinal": data_fim}
     try:
         r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
@@ -266,14 +248,41 @@ def _periodo_para_sgsdates(data_ini: date, data_fim: date):
     return data_ini.strftime("%d/%m/%Y"), data_fim.strftime("%d/%m/%Y")
 
 
+# ==============================
+# AGREGAÇÕES SCR
+# ==============================
+def agregar_inadimplencia_por_ano(df: pd.DataFrame) -> pd.DataFrame:
+    col_taxa = pick_first_col(df, ["taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia"])
+    col_ativa = pick_first_col(df, ["carteira_ativa"])
+    col_inad  = pick_first_col(df, ["carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia"])
+
+    if "ano" not in df.columns:
+        return pd.DataFrame()
+
+    if col_taxa:
+        agg = (
+            df.groupby("ano")[col_taxa]
+            .mean().reset_index()
+            .rename(columns={col_taxa: "taxa_inadimplencia_media"})
+        )
+        agg["taxa_inadimplencia_media"] = pd.to_numeric(agg["taxa_inadimplencia_media"], errors="coerce")
+        if agg["taxa_inadimplencia_media"].dropna().max() <= 1.5:
+            agg["taxa_inadimplencia_media"] *= 100
+        return agg
+
+    if col_inad and col_ativa:
+        grp = df.groupby("ano").agg(inad=(col_inad, "sum"), ativa=(col_ativa, "sum")).reset_index()
+        grp["taxa_inadimplencia_media"] = (grp["inad"] / grp["ativa"].replace(0, np.nan)) * 100
+        return grp[["ano", "taxa_inadimplencia_media"]]
+
+    return pd.DataFrame()
+
+
+# FIX: definida APÓS agregar_inadimplencia_por_ano (que é chamada internamente).
+# Versão cacheada e leve: carrega parquet, agrega e retorna só o resumo (~KB).
+# Evita manter N DataFrames de centenas de MB em memória ao carregar vários anos.
 @st.cache_data(ttl=3600)
 def agregar_inadimplencia_ano_cached(ano: int) -> pd.DataFrame:
-    """
-    Versão cacheada e leve da agregação por ano para a série temporal.
-    Carrega o parquet, agrega imediatamente e descarta o DataFrame completo.
-    Isso evita manter N DataFrames de centenas de MB em memória simultaneamente
-    ao construir a série com múltiplos anos.
-    """
     try:
         df = carregar_scr_parquet_publico(ano)
         if df.empty:
@@ -283,72 +292,31 @@ def agregar_inadimplencia_ano_cached(ano: int) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ==============================
-# AGREGAÇÕES SCR
-# ==============================
-def agregar_inadimplencia_por_ano(df: pd.DataFrame) -> pd.DataFrame:
-    """Retorna taxa média de inadimplência anual."""
-    col_taxa = pick_first_col(df, ["taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia"])
-    col_ativa = pick_first_col(df, ["carteira_ativa"])
-    col_inad = pick_first_col(df, ["carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia"])
-
-    if "ano" not in df.columns:
-        return pd.DataFrame()
-
-    if col_taxa:
-        agg = (
-            df.groupby("ano")[col_taxa]
-            .mean()
-            .reset_index()
-            .rename(columns={col_taxa: "taxa_inadimplencia_media"})
-        )
-        agg["taxa_inadimplencia_media"] = pd.to_numeric(agg["taxa_inadimplencia_media"], errors="coerce")
-        # Normaliza escala (0-1 vs 0-100)
-        if agg["taxa_inadimplencia_media"].dropna().max() <= 1.5:
-            agg["taxa_inadimplencia_media"] *= 100
-        return agg
-
-    if col_inad and col_ativa:
-        grp = df.groupby("ano").agg(
-            inad=(col_inad, "sum"),
-            ativa=(col_ativa, "sum"),
-        ).reset_index()
-        grp["taxa_inadimplencia_media"] = (grp["inad"] / grp["ativa"].replace(0, np.nan)) * 100
-        return grp[["ano", "taxa_inadimplencia_media"]]
-
-    return pd.DataFrame()
-
-
 def agregar_carteira_por_modalidade(df: pd.DataFrame) -> pd.DataFrame:
     col_ativa = pick_first_col(df, ["carteira_ativa", "saldo_carteira_ativa", "carteira_total"])
-    col_mod = pick_first_col(df, ["modalidade", "submodalidade"])
+    col_mod   = pick_first_col(df, ["modalidade", "submodalidade"])
     if not col_ativa or not col_mod:
         return pd.DataFrame()
     grp = (
-        df.groupby(col_mod)[col_ativa]
-        .sum()
-        .reset_index()
+        df.groupby(col_mod)[col_ativa].sum().reset_index()
         .rename(columns={col_mod: "modalidade", col_ativa: "carteira_ativa"})
-        .sort_values("carteira_ativa", ascending=False)
-        .head(15)
+        .sort_values("carteira_ativa", ascending=False).head(15)
     )
     grp["carteira_ativa"] = pd.to_numeric(grp["carteira_ativa"], errors="coerce")
     return grp
 
 
 def agregar_inadimplencia_por_uf(df: pd.DataFrame) -> pd.DataFrame:
-    col_taxa = pick_first_col(df, ["taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia"])
+    col_taxa  = pick_first_col(df, ["taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia"])
     col_ativa = pick_first_col(df, ["carteira_ativa"])
-    col_inad = pick_first_col(df, ["carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia"])
+    col_inad  = pick_first_col(df, ["carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia"])
 
     if "uf" not in df.columns:
         return pd.DataFrame()
 
     if col_taxa:
         grp = (
-            df.groupby("uf")[col_taxa]
-            .mean()
-            .reset_index()
+            df.groupby("uf")[col_taxa].mean().reset_index()
             .rename(columns={col_taxa: "taxa_inadimplencia"})
             .sort_values("taxa_inadimplencia", ascending=False)
         )
@@ -358,10 +326,7 @@ def agregar_inadimplencia_por_uf(df: pd.DataFrame) -> pd.DataFrame:
         return grp
 
     if col_inad and col_ativa:
-        grp = df.groupby("uf").agg(
-            inad=(col_inad, "sum"),
-            ativa=(col_ativa, "sum"),
-        ).reset_index()
+        grp = df.groupby("uf").agg(inad=(col_inad, "sum"), ativa=(col_ativa, "sum")).reset_index()
         grp["taxa_inadimplencia"] = (grp["inad"] / grp["ativa"].replace(0, np.nan)) * 100
         return grp[["uf", "taxa_inadimplencia"]].sort_values("taxa_inadimplencia", ascending=False)
 
@@ -378,13 +343,10 @@ with st.sidebar:
     st.header("🔎 Navegação")
     fonte = st.selectbox(
         "Escolha a seção",
-        [
-            "PTAX (Dólar)",
-            "SCR — Indicadores de Crédito",
-            "Índices Macroeconômicos",
-            "Correlações entre Indicadores",
-        ],
+        ["PTAX (Dólar)", "SCR — Indicadores de Crédito",
+         "Índices Macroeconômicos", "Correlações entre Indicadores"],
     )
+
 
 # ==============================================
 # 1. PTAX
@@ -404,26 +366,22 @@ if fonte == "PTAX (Dólar)":
         if data_ini > data_fim:
             st.error("A data inicial não pode ser maior que a data final.")
             st.stop()
-
         with st.spinner("Consultando API do Banco Central..."):
             df = cotacao_dolar_periodo_df(data_ini, data_fim)
-
         if df.empty:
             st.warning("Nenhuma cotação encontrada para o período.")
             st.stop()
 
-        df_d = dolar_diario(df)
+        df_d  = dolar_diario(df)
         ultima = df.iloc[-1]
-
         c1, c2, c3 = st.columns(3)
-        c1.metric("Última compra", f"R$ {ultima['cotacaoCompra']:.4f}")
-        c2.metric("Última venda", f"R$ {ultima['cotacaoVenda']:.4f}")
-        spread = ultima["cotacaoVenda"] - ultima["cotacaoCompra"]
-        c3.metric("Spread (venda - compra)", f"R$ {spread:.4f}")
+        c1.metric("Última compra",        f"R$ {ultima['cotacaoCompra']:.4f}")
+        c2.metric("Última venda",         f"R$ {ultima['cotacaoVenda']:.4f}")
+        c3.metric("Spread (venda-compra)", f"R$ {ultima['cotacaoVenda'] - ultima['cotacaoCompra']:.4f}")
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_d["dia"], y=df_d["cotacaoCompra"], mode="lines", name="Compra", line=dict(color="#1f77b4")))
-        fig.add_trace(go.Scatter(x=df_d["dia"], y=df_d["cotacaoVenda"], mode="lines", name="Venda", line=dict(color="#ff7f0e")))
+        fig.add_trace(go.Scatter(x=df_d["dia"], y=df_d["cotacaoVenda"],  mode="lines", name="Venda",  line=dict(color="#ff7f0e")))
         fig.update_layout(height=460, xaxis_title="Data", yaxis_title="R$", hovermode="x unified")
         fig.update_xaxes(rangeslider_visible=True)
         st.plotly_chart(fig, use_container_width=True)
@@ -451,45 +409,40 @@ elif fonte == "SCR — Indicadores de Crédito":
         try:
             df_scr = carregar_scr_parquet_publico(ano_sel)
         except Exception as e:
-            v = versao_por_ano(ano_sel)
+            v      = versao_por_ano(ano_sel)
             prefix = S3_PREFIX_V1_KEY if v == "v1" else S3_PREFIX_V2_KEY
-            st.error(
-                f"Falha ao carregar parquet do S3.\n\n"
-                f"Ano: {ano_sel} | Versão: {v}\n"
-                f"Key: {prefix}ano={ano_sel}/scrdata_{ano_sel}.parquet\n\nErro: {e}"
-            )
+            st.error(f"Falha ao carregar parquet do S3.\nAno: {ano_sel} | Versão: {v}\n"
+                     f"Key: {prefix}ano={ano_sel}/scrdata_{ano_sel}.parquet\n\nErro: {e}")
             st.stop()
 
     if df_scr.empty:
         st.warning("Arquivo carregado, mas o DataFrame veio vazio.")
         st.stop()
 
-    st.caption(f"Linhas carregadas: **{len(df_scr):,}** | Colunas: **{len(df_scr.columns)}**")
+    st.caption(f"Linhas: **{len(df_scr):,}** | Colunas: **{len(df_scr.columns)}**")
 
-    # ---- Métricas resumo ----
     col_ativa = pick_first_col(df_scr, ["carteira_ativa", "saldo_carteira_ativa", "carteira_total", "saldo_total"])
     col_inad  = pick_first_col(df_scr, ["carteira_inadimplencia", "saldo_inadimplencia", "inadimplencia"])
     col_taxa  = pick_first_col(df_scr, ["taxa_inadimplencia", "inadimplencia_pct", "pct_inadimplencia"])
 
     c1, c2, c3 = st.columns(3)
+
     if col_ativa:
-        total_ativa = pd.to_numeric(df_scr[col_ativa], errors="coerce").fillna(0).sum()
-        c1.metric("Carteira Ativa Total (R$)", f"{total_ativa:,.0f}")
+        c1.metric("Carteira Ativa Total (R$)", f"{pd.to_numeric(df_scr[col_ativa], errors='coerce').fillna(0).sum():,.0f}")
     else:
         c1.metric("Carteira Ativa Total", "N/D")
 
     if col_inad:
-        total_inad = pd.to_numeric(df_scr[col_inad], errors="coerce").fillna(0).sum()
-        c2.metric("Carteira Inadimplente (R$)", f"{total_inad:,.0f}")
+        c2.metric("Carteira Inadimplente (R$)", f"{pd.to_numeric(df_scr[col_inad], errors='coerce').fillna(0).sum():,.0f}")
     else:
         c2.metric("Carteira Inadimplente", "N/D")
 
+    # FIX: else alinhado com if col_taxa (e não com if not s.empty)
     if col_taxa:
         s = pd.to_numeric(df_scr[col_taxa], errors="coerce").dropna()
         if not s.empty:
             val = float(s.mean())
-            taxa_pct = val if val > 1.5 else val * 100
-            c3.metric("Taxa de Inadimplência Média", f"{taxa_pct:.2f}%")
+            c3.metric("Taxa de Inadimplência Média", f"{val if val > 1.5 else val * 100:.2f}%")
         else:
             c3.metric("Taxa de Inadimplência Média", "N/D")
     else:
@@ -497,26 +450,23 @@ elif fonte == "SCR — Indicadores de Crédito":
 
     st.divider()
 
-    # ---- Aba 1: Série temporal de inadimplência ----
+    # ---- Série temporal ----
     st.subheader("📈 Série Temporal de Inadimplência por Ano")
-    st.caption("Para construir a série completa, selecione múltiplos anos abaixo.")
 
     with st.expander("⚙️ Configurar anos para a série temporal", expanded=True):
-        anos_disponiveis = list(range(2012, 2026))
         anos_serie = st.multiselect(
-            "Anos a incluir na série (máx. 5 para evitar limite de memória no Streamlit Cloud)",
-            options=anos_disponiveis,
+            "Anos a incluir (máx. 5 — limite de memória do Streamlit Cloud)",
+            options=list(range(2012, 2026)),
             default=[ano_sel],
-            max_selections=5,
+            max_selections=5,  # FIX: sem limite = até 14 anos = crash por OOM
         )
 
     if anos_serie:
-        progresso = st.progress(0, text="Carregando dados para a série temporal...")
+        progresso = st.progress(0, text="Carregando...")
         registros = []
         for i, ano in enumerate(sorted(anos_serie)):
             progresso.progress((i + 1) / len(anos_serie), text=f"Carregando {ano}...")
-            # Usa função cacheada que agrega e descarta o df completo,
-            # evitando acúmulo de N DataFrames grandes em memória.
+            # FIX: função leve — só guarda o agregado (~KB), não o df completo (~MB)
             agg = agregar_inadimplencia_ano_cached(ano)
             if not agg.empty:
                 agg["ano_ref"] = ano
@@ -524,50 +474,34 @@ elif fonte == "SCR — Indicadores de Crédito":
         progresso.empty()
 
         if registros:
-            df_serie = pd.concat(registros, ignore_index=True)
-            df_serie = df_serie.sort_values("ano")
-
+            df_serie = pd.concat(registros, ignore_index=True).sort_values("ano")
             fig_serie = go.Figure()
             fig_serie.add_trace(go.Scatter(
-                x=df_serie["ano"].astype(str),
-                y=df_serie["taxa_inadimplencia_media"],
-                mode="lines+markers",
-                name="Taxa de Inadimplência (%)",
-                line=dict(color="#e74c3c", width=2),
-                marker=dict(size=8),
+                x=df_serie["ano"].astype(str), y=df_serie["taxa_inadimplencia_media"],
+                mode="lines+markers", name="Taxa de Inadimplência (%)",
+                line=dict(color="#e74c3c", width=2), marker=dict(size=8),
             ))
-            fig_serie.update_layout(
-                height=400,
-                xaxis_title="Ano",
-                yaxis_title="Taxa de Inadimplência (%)",
-                hovermode="x unified",
-            )
+            fig_serie.update_layout(height=400, xaxis_title="Ano",
+                                    yaxis_title="Taxa de Inadimplência (%)", hovermode="x unified")
             st.plotly_chart(fig_serie, use_container_width=True)
         else:
             st.info("Não foi possível calcular a inadimplência para os anos selecionados.")
 
     st.divider()
 
-    # ---- Composição da carteira por modalidade ----
+    # ---- Composição por modalidade ----
     st.subheader("📦 Composição da Carteira por Modalidade")
     df_mod = agregar_carteira_por_modalidade(df_scr)
 
     if not df_mod.empty:
         df_mod = df_mod.dropna(subset=["carteira_ativa"]).sort_values("carteira_ativa", ascending=True)
         fig_mod = go.Figure(go.Bar(
-            x=df_mod["carteira_ativa"],
-            y=df_mod["modalidade"],
-            orientation="h",
+            x=df_mod["carteira_ativa"], y=df_mod["modalidade"], orientation="h",
             marker_color="#1f77b4",
-            text=df_mod["carteira_ativa"].map(lambda v: f"{v:,.0f}"),
-            textposition="outside",
+            text=df_mod["carteira_ativa"].map(lambda v: f"{v:,.0f}"), textposition="outside",
         ))
-        fig_mod.update_layout(
-            height=max(400, len(df_mod) * 26),
-            xaxis_title="Carteira Ativa (R$)",
-            yaxis_title="Modalidade",
-            margin=dict(l=200, r=80, t=30, b=40),
-        )
+        fig_mod.update_layout(height=max(400, len(df_mod) * 26), xaxis_title="Carteira Ativa (R$)",
+                              margin=dict(l=200, r=80, t=30, b=40))
         st.plotly_chart(fig_mod, use_container_width=True)
     else:
         st.info("Coluna 'modalidade' não encontrada nos dados deste ano.")
@@ -580,37 +514,24 @@ elif fonte == "SCR — Indicadores de Crédito":
 
     if not df_uf.empty:
         df_uf = df_uf.dropna(subset=["taxa_inadimplencia"]).sort_values("taxa_inadimplencia", ascending=True)
-
         fig_uf = go.Figure(go.Bar(
-            x=df_uf["taxa_inadimplencia"],
-            y=df_uf["uf"],
-            orientation="h",
-            marker_color=df_uf["taxa_inadimplencia"],
-            marker_colorscale="RdYlGn_r",
-            text=df_uf["taxa_inadimplencia"].map(lambda v: f"{v:.2f}%"),
-            textposition="outside",
+            x=df_uf["taxa_inadimplencia"], y=df_uf["uf"], orientation="h",
+            marker_color=df_uf["taxa_inadimplencia"], marker_colorscale="RdYlGn_r",
+            text=df_uf["taxa_inadimplencia"].map(lambda v: f"{v:.2f}%"), textposition="outside",
         ))
-        fig_uf.update_layout(
-            height=max(400, len(df_uf) * 22),
-            xaxis_title="Taxa de Inadimplência (%)",
-            yaxis_title="UF",
-            margin=dict(l=60, r=60, t=30, b=40),
-        )
+        fig_uf.update_layout(height=max(400, len(df_uf) * 22), xaxis_title="Taxa de Inadimplência (%)",
+                             margin=dict(l=60, r=60, t=30, b=40))
         st.plotly_chart(fig_uf, use_container_width=True)
     else:
         st.info("Coluna 'uf' não encontrada nos dados deste ano.")
 
     st.divider()
 
-    # ---- Amostra ----
     with st.expander("📋 Amostra dos dados brutos"):
         st.dataframe(df_scr.head(500), use_container_width=True)
-        st.download_button(
-            "⬇️ Baixar amostra (CSV)",
-            data=df_scr.head(50000).to_csv(index=False).encode("utf-8"),
-            file_name=f"scr_{ano_sel}_amostra.csv",
-            mime="text/csv",
-        )
+        st.download_button("⬇️ Baixar amostra (CSV)",
+                           data=df_scr.head(50000).to_csv(index=False).encode("utf-8"),
+                           file_name=f"scr_{ano_sel}_amostra.csv", mime="text/csv")
 
 
 # ==============================================
@@ -626,11 +547,8 @@ elif fonte == "Índices Macroeconômicos":
         hoje = date.today()
         data_ini_macro = st.date_input("Data inicial", value=date(hoje.year - 5, 1, 1), key="macro_ini")
         data_fim_macro = st.date_input("Data final", value=hoje, key="macro_fim")
-        indices_sel = st.multiselect(
-            "Índices a exibir",
-            options=list(BCB_SERIES.keys()),
-            default=list(BCB_SERIES.keys()),
-        )
+        indices_sel = st.multiselect("Índices a exibir", options=list(BCB_SERIES.keys()),
+                                     default=list(BCB_SERIES.keys()))
         buscar = st.button("Buscar índices")
 
     if buscar:
@@ -639,12 +557,10 @@ elif fonte == "Índices Macroeconômicos":
             st.stop()
 
         ini_str, fim_str = _periodo_para_sgsdates(data_ini_macro, data_fim_macro)
-
         dados_macros: dict = {}
         with st.spinner("Consultando API do Banco Central..."):
             for nome in indices_sel:
-                serie_id = BCB_SERIES[nome]
-                df_s = carregar_serie_bcb(serie_id, ini_str, fim_str)
+                df_s = carregar_serie_bcb(BCB_SERIES[nome], ini_str, fim_str)
                 if not df_s.empty:
                     dados_macros[nome] = df_s
 
@@ -652,47 +568,28 @@ elif fonte == "Índices Macroeconômicos":
             st.error("Não foi possível carregar nenhum índice.")
             st.stop()
 
-        # Um gráfico por índice (escala independente)
         for nome, df_idx in dados_macros.items():
             st.subheader(f"📊 {nome}")
-            media = df_idx["valor"].mean()
-            minimo = df_idx["valor"].min()
-            maximo = df_idx["valor"].max()
-
             col1, col2, col3 = st.columns(3)
-            col1.metric("Média do período", f"{media:.2f}")
-            col2.metric("Mínimo", f"{minimo:.2f}")
-            col3.metric("Máximo", f"{maximo:.2f}")
+            col1.metric("Média", f"{df_idx['valor'].mean():.2f}")
+            col2.metric("Mínimo", f"{df_idx['valor'].min():.2f}")
+            col3.metric("Máximo", f"{df_idx['valor'].max():.2f}")
 
             fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=df_idx["data"],
-                y=df_idx["valor"],
-                mode="lines",
-                name=nome,
-                fill="tozeroy",
-                fillcolor="rgba(31,119,180,0.1)",
-                line=dict(color="#1f77b4", width=2),
-            ))
-            fig.update_layout(
-                height=350,
-                xaxis_title="Data",
-                yaxis_title=nome,
-                hovermode="x unified",
-                margin=dict(l=10, r=10, t=20, b=40),
-            )
+            fig.add_trace(go.Scatter(x=df_idx["data"], y=df_idx["valor"], mode="lines", name=nome,
+                                     fill="tozeroy", fillcolor="rgba(31,119,180,0.1)",
+                                     line=dict(color="#1f77b4", width=2)))
+            fig.update_layout(height=350, xaxis_title="Data", yaxis_title=nome,
+                              hovermode="x unified", margin=dict(l=10, r=10, t=20, b=40))
             fig.update_xaxes(rangeslider_visible=True)
             st.plotly_chart(fig, use_container_width=True)
 
             with st.expander("Ver dados tabulares"):
                 st.dataframe(df_idx, use_container_width=True)
-                st.download_button(
-                    f"⬇️ Baixar {nome} (CSV)",
-                    data=df_idx.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{nome.replace(' ', '_').replace('/', '')}.csv",
-                    mime="text/csv",
-                    key=f"dl_{nome}",
-                )
+                st.download_button(f"⬇️ Baixar {nome} (CSV)",
+                                   data=df_idx.to_csv(index=False).encode("utf-8"),
+                                   file_name=f"{nome.replace(' ', '_').replace('/', '')}.csv",
+                                   mime="text/csv", key=f"dl_{nome}")
     else:
         st.info("Configure o período e os índices desejados, depois clique em **Buscar índices**.")
 
@@ -702,10 +599,7 @@ elif fonte == "Índices Macroeconômicos":
 # ==============================================
 elif fonte == "Correlações entre Indicadores":
     st.subheader("🔗 Correlações entre Indicadores do BCB")
-    st.caption(
-        "Comparação visual entre séries macroeconômicas (Selic, IPCA, Juros PF) e "
-        "a taxa de inadimplência do SCR ao longo do tempo, usando gráfico de linhas com eixo duplo."
-    )
+    st.caption("Comparação entre séries macroeconômicas e inadimplência SCR com eixo duplo.")
 
     with st.sidebar:
         st.divider()
@@ -714,23 +608,19 @@ elif fonte == "Correlações entre Indicadores":
         data_ini_corr = st.date_input("Data inicial", value=date(hoje.year - 5, 1, 1), key="corr_ini")
         data_fim_corr = st.date_input("Data final", value=hoje, key="corr_fim")
 
-        indice_eixo1 = st.selectbox(
-            "Indicador — Eixo Esquerdo",
-            options=list(BCB_SERIES.keys()),
-            index=0,
-        )
-        indice_eixo2 = st.selectbox(
-            "Indicador — Eixo Direito",
-            options=list(BCB_SERIES.keys()) + ["Inadimplência SCR (%)"],
-            index=len(BCB_SERIES),
-        )
+        indice_eixo1 = st.selectbox("Indicador — Eixo Esquerdo",
+                                    options=list(BCB_SERIES.keys()), index=0)
+        indice_eixo2 = st.selectbox("Indicador — Eixo Direito",
+                                    options=list(BCB_SERIES.keys()) + ["Inadimplência SCR (%)"],
+                                    index=len(BCB_SERIES))
 
+        # FIX: else branch garante que anos_inad sempre existe (evita NameError)
         if "Inadimplência SCR (%)" in [indice_eixo1, indice_eixo2]:
             anos_inad = st.multiselect(
-                "Anos do SCR para inadimplência (máx. 3)",
+                "Anos do SCR (máx. 3)",
                 options=list(range(2012, 2026)),
                 default=list(range(max(2020, data_ini_corr.year), min(2026, data_fim_corr.year + 1))),
-                max_selections=3,
+                max_selections=3,  # FIX: limita consumo de memória
             )
         else:
             anos_inad = []
@@ -740,7 +630,6 @@ elif fonte == "Correlações entre Indicadores":
     if calcular:
         ini_str, fim_str = _periodo_para_sgsdates(data_ini_corr, data_fim_corr)
 
-        # Carrega eixo 1
         serie_e1 = None
         if indice_eixo1 in BCB_SERIES:
             with st.spinner(f"Carregando {indice_eixo1}..."):
@@ -748,7 +637,6 @@ elif fonte == "Correlações entre Indicadores":
             if not df_e1.empty:
                 serie_e1 = df_e1.rename(columns={"valor": indice_eixo1}).set_index("data")[indice_eixo1]
 
-        # Carrega eixo 2
         serie_e2 = None
         if indice_eixo2 in BCB_SERIES:
             with st.spinner(f"Carregando {indice_eixo2}..."):
@@ -757,18 +645,14 @@ elif fonte == "Correlações entre Indicadores":
                 serie_e2 = df_e2.rename(columns={"valor": indice_eixo2}).set_index("data")[indice_eixo2]
 
         elif indice_eixo2 == "Inadimplência SCR (%)":
-            with st.spinner("Calculando inadimplência SCR por ano..."):
+            with st.spinner("Calculando inadimplência SCR..."):
                 registros_inad = []
                 for ano in sorted(anos_inad):
-                    try:
-                        df_ano = carregar_scr_parquet_publico(ano)
-                        agg = agregar_inadimplencia_por_ano(df_ano)
-                        if not agg.empty:
-                            # Usa o meio do ano como referência temporal
-                            agg["data"] = pd.to_datetime(agg["ano"].astype(str) + "-06-30")
-                            registros_inad.append(agg[["data", "taxa_inadimplencia_media"]])
-                    except Exception:
-                        pass
+                    # FIX: função leve — não acumula df completo em memória
+                    agg = agregar_inadimplencia_ano_cached(ano)
+                    if not agg.empty:
+                        agg["data"] = pd.to_datetime(agg["ano"].astype(str) + "-06-30")
+                        registros_inad.append(agg[["data", "taxa_inadimplencia_media"]])
 
             if registros_inad:
                 df_inad_serie = pd.concat(registros_inad).sort_values("data")
@@ -779,57 +663,35 @@ elif fonte == "Correlações entre Indicadores":
             st.error("Não foi possível carregar nenhuma série.")
             st.stop()
 
-        # ---- Gráfico de linhas com eixo duplo ----
+        # ---- Gráfico de linhas eixo duplo ----
         fig_corr = make_subplots(specs=[[{"secondary_y": True}]])
 
         if serie_e1 is not None:
-            fig_corr.add_trace(
-                go.Scatter(
-                    x=serie_e1.index,
-                    y=serie_e1.values,
-                    mode="lines",
-                    name=indice_eixo1,
-                    line=dict(color="#1f77b4", width=2),
-                ),
-                secondary_y=False,
-            )
-
+            fig_corr.add_trace(go.Scatter(x=serie_e1.index, y=serie_e1.values, mode="lines",
+                                          name=indice_eixo1, line=dict(color="#1f77b4", width=2)),
+                               secondary_y=False)
         if serie_e2 is not None:
-            fig_corr.add_trace(
-                go.Scatter(
-                    x=serie_e2.index,
-                    y=serie_e2.values,
-                    mode="lines+markers" if indice_eixo2 == "Inadimplência SCR (%)" else "lines",
-                    name=indice_eixo2,
-                    line=dict(color="#e74c3c", width=2, dash="dot"),
-                    marker=dict(size=7),
-                ),
-                secondary_y=True,
-            )
+            fig_corr.add_trace(go.Scatter(
+                x=serie_e2.index, y=serie_e2.values,
+                mode="lines+markers" if indice_eixo2 == "Inadimplência SCR (%)" else "lines",
+                name=indice_eixo2, line=dict(color="#e74c3c", width=2, dash="dot"),
+                marker=dict(size=7)), secondary_y=True)
 
-        fig_corr.update_layout(
-            height=500,
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=10, r=10, t=50, b=40),
-        )
+        fig_corr.update_layout(height=500, hovermode="x unified",
+                               legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                               margin=dict(l=10, r=10, t=50, b=40))
         fig_corr.update_xaxes(title_text="Data")
         fig_corr.update_yaxes(title_text=indice_eixo1 if serie_e1 is not None else "", secondary_y=False)
         fig_corr.update_yaxes(title_text=indice_eixo2 if serie_e2 is not None else "", secondary_y=True)
-
         st.plotly_chart(fig_corr, use_container_width=True)
 
-        # ---- Correlação numérica ----
+        # ---- Correlação de Pearson ----
         if serie_e1 is not None and serie_e2 is not None:
             st.divider()
             st.subheader("📐 Correlação de Pearson")
 
             def _para_serie_mensal(s: pd.Series) -> pd.Series:
-                """
-                Garante DatetimeIndex antes do resample.
-                Séries SCR têm índice int (ano); séries BCB têm DatetimeIndex.
-                Sem esta conversão, resample('ME') lança TypeError.
-                """
+                # FIX: séries SCR têm índice int — resample exige DatetimeIndex
                 if not isinstance(s.index, pd.DatetimeIndex):
                     try:
                         s = s.copy()
@@ -839,75 +701,50 @@ elif fonte == "Correlações entre Indicadores":
                 return s.resample("ME").mean()
 
             def _reset_com_data(s: pd.Series) -> pd.DataFrame:
-                """
-                Força colunas para ['data', valor] após reset_index.
-                Evita colisão quando o nome do índice não é 'data'
-                ou quando serie.name coincide com 'data'.
-                """
+                # FIX: força colunas para ['data', valor] independente do nome do índice
                 df_r = s.reset_index()
                 df_r.columns = ["data", s.name]
                 return df_r
 
             s1_m = _para_serie_mensal(serie_e1).rename("e1")
             s2_m = _para_serie_mensal(serie_e2).rename("e2")
-
-            df_merged = pd.merge(
-                _reset_com_data(s1_m),
-                _reset_com_data(s2_m),
-                on="data",
-                how="inner",
-            ).dropna()
+            df_merged = pd.merge(_reset_com_data(s1_m), _reset_com_data(s2_m),
+                                 on="data", how="inner").dropna()
 
             if len(df_merged) >= 3:
-                corr = df_merged["e1"].corr(df_merged["e2"])
+                corr    = df_merged["e1"].corr(df_merged["e2"])
                 cor_abs = abs(corr)
-                interpretacao = (
-                    "correlação forte" if cor_abs >= 0.7
-                    else "correlação moderada" if cor_abs >= 0.4
-                    else "correlação fraca"
-                )
+                interpretacao = ("correlação forte" if cor_abs >= 0.7
+                                 else "correlação moderada" if cor_abs >= 0.4
+                                 else "correlação fraca")
                 direcao = "positiva" if corr >= 0 else "negativa"
 
                 col_a, col_b = st.columns([1, 3])
-                col_a.metric(
-                    "Coeficiente de Pearson (r)",
-                    f"{corr:.4f}",
-                    help="Varia de -1 (correlação negativa perfeita) a +1 (correlação positiva perfeita).",
-                )
-                col_b.info(
-                    f"Os dois indicadores apresentam **{interpretacao} {direcao}** "
-                    f"(r = {corr:.4f}), calculada sobre {len(df_merged)} observações mensais comuns."
-                )
+                col_a.metric("Coeficiente de Pearson (r)", f"{corr:.4f}",
+                             help="Varia de -1 a +1.")
+                col_b.info(f"Os dois indicadores apresentam **{interpretacao} {direcao}** "
+                           f"(r = {corr:.4f}), com {len(df_merged)} observações mensais comuns.")
 
-                # Scatter com tendência via numpy.polyfit — sem statsmodels
-                # (px.scatter trendline="ols" requer statsmodels, ausente no requirements.txt)
-                x_vals = df_merged["e1"].values
-                y_vals = df_merged["e2"].values
-                coef = np.polyfit(x_vals, y_vals, 1)
+                # FIX: numpy.polyfit em vez de px.scatter(trendline='ols')
+                # que exige statsmodels (ausente no requirements.txt)
+                x_vals  = df_merged["e1"].values
+                y_vals  = df_merged["e2"].values
+                coef    = np.polyfit(x_vals, y_vals, 1)
                 trend_y = np.polyval(coef, x_vals)
 
                 fig_scatter = go.Figure()
-                fig_scatter.add_trace(go.Scatter(
-                    x=x_vals, y=y_vals,
-                    mode="markers", name="Observações",
-                    marker=dict(color="#1f77b4", size=7, opacity=0.7),
-                ))
-                fig_scatter.add_trace(go.Scatter(
-                    x=x_vals, y=trend_y,
-                    mode="lines",
-                    name=f"Tendência (y = {coef[0]:.4f}x + {coef[1]:.4f})",
-                    line=dict(color="#e74c3c", width=2, dash="dash"),
-                ))
-                fig_scatter.update_layout(
-                    height=400,
-                    xaxis_title=indice_eixo1,
-                    yaxis_title=indice_eixo2,
-                    title=f"Dispersão: {indice_eixo1} × {indice_eixo2}",
-                    hovermode="closest",
-                )
+                fig_scatter.add_trace(go.Scatter(x=x_vals, y=y_vals, mode="markers",
+                                                 name="Observações",
+                                                 marker=dict(color="#1f77b4", size=7, opacity=0.7)))
+                fig_scatter.add_trace(go.Scatter(x=x_vals, y=trend_y, mode="lines",
+                                                 name=f"Tendência (y={coef[0]:.4f}x+{coef[1]:.4f})",
+                                                 line=dict(color="#e74c3c", width=2, dash="dash")))
+                fig_scatter.update_layout(height=400, xaxis_title=indice_eixo1,
+                                          yaxis_title=indice_eixo2,
+                                          title=f"Dispersão: {indice_eixo1} × {indice_eixo2}",
+                                          hovermode="closest")
                 st.plotly_chart(fig_scatter, use_container_width=True)
             else:
                 st.warning("Período de sobreposição entre as séries muito curto para calcular correlação.")
-
     else:
         st.info("Configure os indicadores e o período, depois clique em **Calcular correlações**.")
