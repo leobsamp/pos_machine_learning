@@ -616,11 +616,18 @@ elif fonte == "Correlações entre Indicadores":
 
         # FIX: else branch garante que anos_inad sempre existe (evita NameError)
         if "Inadimplência SCR (%)" in [indice_eixo1, indice_eixo2]:
+            # O default precisa ter no máximo max_selections itens.
+            # Se o intervalo de datas gerar mais de 3 anos, o Streamlit
+            # lança StreamlitSelectionCountExceedsMaxError antes de renderizar.
+            _anos_default = list(range(
+                max(2020, data_ini_corr.year),
+                min(2026, data_fim_corr.year + 1)
+            ))[-3:]  # trunca para os 3 anos mais recentes do intervalo
             anos_inad = st.multiselect(
                 "Anos do SCR (máx. 3)",
                 options=list(range(2012, 2026)),
-                default=list(range(max(2020, data_ini_corr.year), min(2026, data_fim_corr.year + 1))),
-                max_selections=3,  # FIX: limita consumo de memória
+                default=_anos_default,
+                max_selections=3,
             )
         else:
             anos_inad = []
